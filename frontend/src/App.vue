@@ -16,16 +16,40 @@ const messageType = ref('info')
 const walletAddress = ref('')
 const balance = ref(0)
 const stakeAmount = ref(1000)
-const homeOdds = computed(() => contractMatch.value ? parseFloat(((contractMatch.value.draw_stakes + contractMatch.value.away_stakes + stakeAmount.value) / (contractMatch.value.home_stakes + stakeAmount.value || 1)).toFixed(2)) : 2.0)
-const drawOdds = computed(() => contractMatch.value ? parseFloat(((contractMatch.value.home_stakes + contractMatch.value.away_stakes + stakeAmount.value) / (contractMatch.value.draw_stakes + stakeAmount.value || 1)).toFixed(2)) : 3.0)
-const awayOdds = computed(() => contractMatch.value ? parseFloat(((contractMatch.value.home_stakes + contractMatch.value.draw_stakes + stakeAmount.value) / (contractMatch.value.away_stakes + stakeAmount.value || 1)).toFixed(2)) : 2.5)
+const normalizedStake = computed(() => Math.max(100, Number(stakeAmount.value) || 100))
+const homeStake = computed(() => Number(contractMatch.value?.home_stakes) || 0)
+const drawStake = computed(() => Number(contractMatch.value?.draw_stakes) || 0)
+const awayStake = computed(() => Number(contractMatch.value?.away_stakes) || 0)
+const totalPool = computed(() => homeStake.value + drawStake.value + awayStake.value)
+const homeOdds = computed(() => contractMatch.value ? parseFloat(((drawStake.value + awayStake.value + normalizedStake.value) / Math.max(homeStake.value + normalizedStake.value, 1)).toFixed(2)) : 2.0)
+const drawOdds = computed(() => contractMatch.value ? parseFloat(((homeStake.value + awayStake.value + normalizedStake.value) / Math.max(drawStake.value + normalizedStake.value, 1)).toFixed(2)) : 3.0)
+const awayOdds = computed(() => contractMatch.value ? parseFloat(((homeStake.value + drawStake.value + normalizedStake.value) / Math.max(awayStake.value + normalizedStake.value, 1)).toFixed(2)) : 2.5)
+const finishedStatuses = new Set(['FT', 'AET', 'PEN'])
+const closedStatuses = new Set(['FT', 'AET', 'PEN', 'CANC', 'PST', 'ABD', 'AWD', 'WO'])
+
+function getLocalMatchDate() {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  })
+
+  return formatter.format(new Date())
+}
 
 async function connectWallet() {
   try {
+    if (!(window as any).ethereum) {
+      message.value = 'No browser wallet found.'
+      messageType.value = 'error'
+      return
+    }
     const accounts = await (window as any).ethereum.request({ method: 'eth_requestAccounts' })
     walletAddress.value = accounts[0]
   } catch (e) {
     console.error(e)
+    message.value = 'Wallet connection failed.'
+    messageType.value = 'error'
   }
 }
 
@@ -47,19 +71,26 @@ async function getClient() {
 async function fetchMatches() {
   loading.value = true
   try {
-    const d = new Date()
-d.setDate(d.getDate() + 1)
-const today = d.toISOString().split('T')[0]
+    const today = getLocalMatchDate()
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
     const res = await fetch(
-      `https://v3.football.api-sports.io/fixtures?date=${today}&timezone=UTC`,
+      `https://v3.football.api-sports.io/fixtures?date=${today}&timezone=${encodeURIComponent(timezone)}`,
       { headers: { 'x-apisports-key': API_KEY } }
     )
+    if (!res.ok) throw new Error(`Football API request failed with ${res.status}`)
     const data = await res.json()
-    matches.value = data.response.slice(0, 30)
+    if (!Array.isArray(data.response)) throw new Error(data.message || 'Football API returned no matches')
+    matches.value = data.response
+      .filter((match: any) => !finishedStatuses.has(match.fixture.status.short))
+      .slice(0, 30)
   } catch (e) {
     console.error(e)
+    matches.value = []
+    message.value = 'Could not load matches. Check your API key or try again later.'
+    messageType.value = 'error'
+  } finally {
+    loading.value = false
   }
-  loading.value = false
 }
 
 async function selectMatch(match: any) {
@@ -82,6 +113,16 @@ async function selectMatch(match: any) {
 }
 
 async function createAndStake(match: any, prediction: string) {
+  if (closedStatuses.has(match.fixture.status.short)) {
+    message.value = 'This match is already closed for predictions.'
+    messageType.value = 'error'
+    return
+  }
+  if (balance.value < normalizedStake.value) {
+    message.value = 'Claim tokens or lower your stake amount first.'
+    messageType.value = 'error'
+    return
+  }
   creating.value = true
   staking.value = true
   message.value = 'Adding match to blockchain...'
@@ -104,11 +145,12 @@ async function createAndStake(match: any, prediction: string) {
     await client.writeContract({
       address: CONTRACT_ADDRESS,
       functionName: 'stake',
-      args: [matchId, prediction, 100, '0xBceFf82Fa1473e28bB00E1A20CCD61ABce0477b2'],
+      args: [matchId, prediction, normalizedStake.value, walletAddress.value || '0xBceFf82Fa1473e28bB00E1A20CCD61ABce0477b2'],
       value: 0n,
       leaderOnly: true
     } as any)
 
+    balance.value = Math.max(0, balance.value - normalizedStake.value)
     message.value = 'Stake placed successfully!'
     messageType.value = 'success'
     await selectMatch(match)
@@ -123,6 +165,16 @@ async function createAndStake(match: any, prediction: string) {
 
 async function stake(prediction: string) {
   if (!selectedMatch.value) return
+  if (closedStatuses.has(selectedMatch.value.fixture.status.short)) {
+    message.value = 'This match is already closed for predictions.'
+    messageType.value = 'error'
+    return
+  }
+  if (balance.value < normalizedStake.value) {
+    message.value = 'Claim tokens or lower your stake amount first.'
+    messageType.value = 'error'
+    return
+  }
   staking.value = true
   message.value = 'Placing stake...'
   messageType.value = 'info'
@@ -133,11 +185,12 @@ async function stake(prediction: string) {
     await client.writeContract({
       address: CONTRACT_ADDRESS,
       functionName: 'stake',
-      args: [matchId, prediction, 100, '0xBceFf82Fa1473e28bB00E1A20CCD61ABce0477b2'],
+      args: [matchId, prediction, normalizedStake.value, walletAddress.value || '0xBceFf82Fa1473e28bB00E1A20CCD61ABce0477b2'],
       value: 0n,
       leaderOnly: true
     } as any)
 
+    balance.value = Math.max(0, balance.value - normalizedStake.value)
     message.value = 'Stake placed successfully!'
     messageType.value = 'success'
     await selectMatch(selectedMatch.value)
@@ -302,23 +355,23 @@ onMounted(fetchMatches)
             <div class="pool-bar">
               <div class="pool-label">{{ selectedMatch.teams.home.name }} Win</div>
               <div class="pool-track">
-                <div class="pool-fill home" :style="{ width: contractMatch.home_stakes + contractMatch.draw_stakes + contractMatch.away_stakes > 0 ? (contractMatch.home_stakes / (contractMatch.home_stakes + contractMatch.draw_stakes + contractMatch.away_stakes) * 100) + '%' : '33%' }"></div>
+                <div class="pool-fill home" :style="{ width: totalPool > 0 ? (homeStake / totalPool * 100) + '%' : '33%' }"></div>
               </div>
-              <div class="pool-amount">{{ contractMatch.home_stakes }} GENPRED</div>
+              <div class="pool-amount">{{ homeStake.toLocaleString() }} GENPRED</div>
             </div>
             <div class="pool-bar">
               <div class="pool-label">Draw</div>
               <div class="pool-track">
-                <div class="pool-fill draw" :style="{ width: contractMatch.home_stakes + contractMatch.draw_stakes + contractMatch.away_stakes > 0 ? (contractMatch.draw_stakes / (contractMatch.home_stakes + contractMatch.draw_stakes + contractMatch.away_stakes) * 100) + '%' : '33%' }"></div>
+                <div class="pool-fill draw" :style="{ width: totalPool > 0 ? (drawStake / totalPool * 100) + '%' : '33%' }"></div>
               </div>
-              <div class="pool-amount">{{ contractMatch.draw_stakes }} GENPRED</div>
+              <div class="pool-amount">{{ drawStake.toLocaleString() }} GENPRED</div>
             </div>
             <div class="pool-bar">
               <div class="pool-label">{{ selectedMatch.teams.away.name }} Win</div>
               <div class="pool-track">
-                <div class="pool-fill away" :style="{ width: contractMatch.home_stakes + contractMatch.draw_stakes + contractMatch.away_stakes > 0 ? (contractMatch.away_stakes / (contractMatch.home_stakes + contractMatch.draw_stakes + contractMatch.away_stakes) * 100) + '%' : '33%' }"></div>
+                <div class="pool-fill away" :style="{ width: totalPool > 0 ? (awayStake / totalPool * 100) + '%' : '33%' }"></div>
               </div>
-              <div class="pool-amount">{{ contractMatch.away_stakes }} GENPRED</div>
+              <div class="pool-amount">{{ awayStake.toLocaleString() }} GENPRED</div>
             </div>
           </div>
 
@@ -330,13 +383,13 @@ onMounted(fetchMatches)
             <div class="predict-hint">Your balance: {{ balance.toLocaleString() }} GENPRED</div>
 <div class="stake-input-row">
   <label>Stake amount:</label>
-  <input type="number" v-model="stakeAmount" min="100" step="100" class="stake-input" />
+  <input type="number" v-model.number="stakeAmount" min="100" step="100" class="stake-input" />
   <span class="stake-currency">GENPRED</span>
 </div>
 <div class="odds-row">
-  <div class="odd-box">Home Win odds: <strong>{{ homeOdds }}x</strong> — Win: <strong>{{ (stakeAmount * homeOdds).toLocaleString() }} GENPRED</strong></div>
-  <div class="odd-box">Draw odds: <strong>{{ drawOdds }}x</strong> — Win: <strong>{{ (stakeAmount * drawOdds).toLocaleString() }} GENPRED</strong></div>
-  <div class="odd-box">Away Win odds: <strong>{{ awayOdds }}x</strong> — Win: <strong>{{ (stakeAmount * awayOdds).toLocaleString() }} GENPRED</strong></div>
+  <div class="odd-box">Home Win odds: <strong>{{ homeOdds }}x</strong> · Win: <strong>{{ (normalizedStake * homeOdds).toLocaleString() }} GENPRED</strong></div>
+  <div class="odd-box">Draw odds: <strong>{{ drawOdds }}x</strong> · Win: <strong>{{ (normalizedStake * drawOdds).toLocaleString() }} GENPRED</strong></div>
+  <div class="odd-box">Away Win odds: <strong>{{ awayOdds }}x</strong> · Win: <strong>{{ (normalizedStake * awayOdds).toLocaleString() }} GENPRED</strong></div>
 </div>
             <div class="predict-btns">
               <button class="pbtn home" @click="stake('home')" :disabled="staking">
@@ -378,6 +431,7 @@ onMounted(fetchMatches)
 
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Unbounded:wght@400;700;900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -810,4 +864,738 @@ body {
 .odds-row { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
 .odd-box { background: #1a1a1a; border: 1px solid #222; padding: 10px 16px; border-radius: 8px; font-size: 13px; color: #888; }
 .odd-box strong { color: #22c55e; }
+
+:root {
+  --page: #f3f6f1;
+  --surface: #ffffff;
+  --surface-soft: #e9efe6;
+  --surface-strong: #10382b;
+  --ink: #14211b;
+  --muted: #65736c;
+  --line: #d7e0d6;
+  --primary: #147d64;
+  --primary-dark: #0c5f4b;
+  --accent: #e1a72f;
+  --danger: #c24138;
+  --success: #248a4d;
+  --shadow: 0 18px 48px rgba(34, 55, 43, 0.11);
+}
+
+body {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background:
+    linear-gradient(135deg, rgba(20, 125, 100, 0.08), transparent 36%),
+    linear-gradient(315deg, rgba(225, 167, 47, 0.16), transparent 32%),
+    var(--page);
+  color: var(--ink);
+}
+
+.app {
+  background: transparent;
+  color: var(--ink);
+}
+
+.app::before {
+  display: none;
+}
+
+.navbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 24px;
+  align-items: center;
+  height: auto;
+  min-height: 76px;
+  padding: 14px clamp(18px, 4vw, 56px);
+  background: rgba(255, 255, 255, 0.86);
+  border: 0;
+  border-bottom: 1px solid rgba(16, 56, 43, 0.12);
+  border-radius: 0;
+  box-shadow: 0 10px 32px rgba(20, 33, 27, 0.08);
+  backdrop-filter: blur(18px);
+  animation: none;
+  letter-spacing: 0;
+}
+
+.nav-logo {
+  color: var(--surface-strong);
+  font-family: inherit;
+  font-size: 1.1rem;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-shadow: none;
+  text-transform: none;
+  border: 0;
+  padding: 0;
+}
+
+.nav-tabs,
+.nav-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.nav-tabs {
+  justify-content: center;
+}
+
+.nav-right {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.nav-tab,
+.btn-connect,
+.btn-claim,
+.btn-refresh,
+.btn-primary,
+.btn-outline,
+.pbtn {
+  border-radius: 8px;
+  font-family: inherit;
+  font-weight: 700;
+  letter-spacing: 0;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, background 0.18s ease, border-color 0.18s ease;
+}
+
+.nav-tab {
+  padding: 10px 16px;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid transparent;
+  font-size: 0.92rem;
+}
+
+.nav-tab:hover,
+.nav-tab.active {
+  background: var(--surface-soft);
+  color: var(--surface-strong);
+  border-color: var(--line);
+}
+
+.btn-connect,
+.btn-claim,
+.btn-primary {
+  background: var(--primary);
+  color: #fff;
+  border: 1px solid var(--primary);
+  box-shadow: 0 10px 24px rgba(20, 125, 100, 0.22);
+}
+
+.btn-connect,
+.btn-claim {
+  padding: 10px 14px;
+  font-size: 0.86rem;
+}
+
+.btn-claim {
+  background: var(--surface-strong);
+  border-color: var(--surface-strong);
+}
+
+.btn-primary {
+  padding: 14px 22px;
+  font-size: 0.98rem;
+}
+
+.btn-primary:hover,
+.btn-connect:hover,
+.btn-claim:hover {
+  background: var(--primary-dark);
+  color: #fff;
+  border-color: var(--primary-dark);
+  transform: translateY(-1px);
+}
+
+.btn-outline,
+.btn-refresh {
+  background: rgba(255, 255, 255, 0.7);
+  color: var(--surface-strong);
+  border: 1px solid var(--line);
+  box-shadow: none;
+}
+
+.btn-outline {
+  padding: 14px 22px;
+  font-size: 0.98rem;
+}
+
+.btn-refresh {
+  padding: 10px 16px;
+  font-size: 0.9rem;
+}
+
+.btn-outline:hover,
+.btn-refresh:hover {
+  background: var(--surface);
+  border-color: rgba(20, 125, 100, 0.35);
+  color: var(--primary-dark);
+}
+
+.nav-wallet,
+.nav-balance {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--surface-strong);
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.tab-content {
+  width: min(1160px, calc(100% - 32px));
+  max-width: none;
+  margin: 0 auto;
+  padding: 44px 0 64px;
+  animation: none;
+}
+
+.hero {
+  display: grid;
+  align-content: center;
+  min-height: 420px;
+  padding: clamp(48px, 8vw, 86px);
+  overflow: hidden;
+  text-align: left;
+  background:
+    linear-gradient(110deg, rgba(16, 56, 43, 0.96), rgba(20, 125, 100, 0.88)),
+    url('https://images.unsplash.com/photo-1508098682722-e99c43a406b2?auto=format&fit=crop&w=1600&q=80');
+  background-position: center;
+  background-size: cover;
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  animation: none;
+}
+
+.hero-badge {
+  width: fit-content;
+  margin: 0 0 22px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 999px;
+  box-shadow: none;
+  color: #f7fbf8;
+  font-family: inherit;
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  animation: none;
+}
+
+.hero-title,
+h1,
+h2 {
+  color: inherit;
+  font-family: inherit;
+  letter-spacing: 0;
+  text-shadow: none;
+  text-transform: none;
+}
+
+.hero-title {
+  max-width: 760px;
+  margin: 0 0 18px;
+  color: #fff;
+  font-size: clamp(2.6rem, 7vw, 5.8rem);
+  font-weight: 800;
+  line-height: 0.96;
+}
+
+.hero-subtitle {
+  max-width: 660px;
+  margin: 0 0 30px;
+  padding: 0;
+  color: rgba(255, 255, 255, 0.82);
+  font-family: inherit;
+  font-size: clamp(1rem, 2vw, 1.22rem);
+  font-weight: 500;
+  line-height: 1.65;
+  text-shadow: none;
+  text-transform: none;
+  animation: none;
+}
+
+.hero-buttons {
+  justify-content: flex-start;
+  gap: 12px;
+  margin: 0;
+  animation: none;
+}
+
+.features {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin: 22px 0;
+}
+
+.feature,
+.match-card,
+.predict-teams,
+.predict-contract,
+.not-on-chain,
+.stat,
+.empty-state {
+  background: rgba(255, 255, 255, 0.88);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(34, 55, 43, 0.07);
+}
+
+.feature {
+  padding: 22px;
+  text-align: left;
+  animation: none;
+}
+
+.feature-icon {
+  margin-bottom: 14px;
+  padding: 6px 10px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  box-shadow: none;
+  color: var(--primary-dark);
+  font-size: 0.76rem;
+  letter-spacing: 0;
+}
+
+.feature-title {
+  color: var(--ink);
+  font-size: 1rem;
+}
+
+.feature-desc,
+.stat-label,
+.hero-subtitle,
+.empty-desc,
+.predict-hint,
+.first-hint,
+.not-on-chain p,
+.predict-league,
+.card-league,
+.card-action,
+.predict-team-label,
+.pool-title,
+.pool-label,
+.pool-amount,
+.stake-currency {
+  color: var(--muted);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  margin-top: 22px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.stat {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 28px 18px;
+}
+
+.stat-value {
+  color: var(--surface-strong);
+  font-size: 2rem;
+  text-shadow: none;
+}
+
+.matches-header {
+  margin-bottom: 18px;
+}
+
+.matches-header h2 {
+  color: var(--ink);
+  font-size: clamp(1.8rem, 4vw, 2.8rem);
+  font-weight: 800;
+}
+
+.loading {
+  color: var(--muted);
+}
+
+.matches-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.match-card {
+  padding: 18px;
+}
+
+.match-card:hover {
+  background: #fff;
+  border-color: rgba(20, 125, 100, 0.36);
+  box-shadow: var(--shadow);
+  transform: translateY(-2px);
+}
+
+.card-league {
+  margin-bottom: 18px;
+  font-size: 0.74rem;
+}
+
+.card-teams {
+  gap: 12px;
+}
+
+.card-logo {
+  width: 44px;
+  height: 44px;
+}
+
+.card-name {
+  color: var(--ink);
+  font-size: 0.84rem;
+}
+
+.card-vs-text,
+.card-score,
+.predict-score {
+  color: var(--surface-strong);
+}
+
+.card-status.ns,
+.predict-status.ns {
+  color: var(--accent);
+}
+
+.card-status.ft,
+.predict-status.ft {
+  color: var(--success);
+}
+
+.predict-league {
+  margin-bottom: 16px;
+  font-size: 0.92rem;
+  font-weight: 700;
+}
+
+.predict-teams {
+  padding: clamp(20px, 4vw, 34px);
+}
+
+.predict-logo {
+  width: 76px;
+  height: 76px;
+}
+
+.predict-team-name {
+  color: var(--ink);
+}
+
+.predict-contract,
+.not-on-chain {
+  padding: clamp(20px, 4vw, 32px);
+}
+
+.pool-title {
+  font-weight: 800;
+}
+
+.pool-track {
+  height: 8px;
+  background: var(--surface-soft);
+}
+
+.pool-fill.home {
+  background: var(--success);
+}
+
+.pool-fill.draw {
+  background: var(--accent);
+}
+
+.pool-fill.away {
+  background: var(--danger);
+}
+
+.stake-input-row {
+  flex-wrap: wrap;
+}
+
+.stake-input {
+  width: 160px;
+  background: #fff;
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+
+.odds-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.odd-box {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.odd-box strong {
+  color: var(--surface-strong);
+}
+
+.predict-btns {
+  gap: 10px;
+}
+
+.pbtn {
+  min-height: 54px;
+  border-width: 1px;
+}
+
+.pbtn.home {
+  background: rgba(36, 138, 77, 0.1);
+  border-color: rgba(36, 138, 77, 0.24);
+  color: #176339;
+}
+
+.pbtn.draw {
+  background: rgba(225, 167, 47, 0.14);
+  border-color: rgba(225, 167, 47, 0.28);
+  color: #8a620e;
+}
+
+.pbtn.away {
+  background: rgba(194, 65, 56, 0.1);
+  border-color: rgba(194, 65, 56, 0.24);
+  color: #92312b;
+}
+
+.pbtn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 26px rgba(34, 55, 43, 0.09);
+}
+
+.result-banner {
+  background: rgba(36, 138, 77, 0.1);
+  border-color: rgba(36, 138, 77, 0.2);
+  color: var(--success);
+}
+
+.msg {
+  border-radius: 8px;
+  font-weight: 700;
+}
+
+.msg.info {
+  background: rgba(20, 125, 100, 0.1);
+  border-color: rgba(20, 125, 100, 0.22);
+  color: var(--primary-dark);
+}
+
+.msg.success {
+  background: rgba(36, 138, 77, 0.1);
+  border-color: rgba(36, 138, 77, 0.2);
+  color: var(--success);
+}
+
+.msg.error {
+  background: rgba(194, 65, 56, 0.1);
+  border-color: rgba(194, 65, 56, 0.22);
+  color: var(--danger);
+}
+
+@media (max-width: 900px) {
+  .navbar {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .nav-tabs,
+  .nav-right {
+    justify-content: flex-start;
+    width: 100%;
+    overflow-x: auto;
+  }
+
+  .features,
+  .matches-grid,
+  .odds-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .tab-content {
+    width: 100%;
+    padding: 18px 12px 40px;
+  }
+
+  .navbar {
+    position: relative;
+    padding: 12px;
+    min-height: 0;
+    box-shadow: 0 8px 24px rgba(20, 33, 27, 0.08);
+  }
+
+  .nav-logo {
+    font-size: 1rem;
+  }
+
+  .nav-tabs,
+  .nav-right {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    overflow: visible;
+  }
+
+  .nav-right {
+    grid-template-columns: 1fr;
+  }
+
+  .nav-tab,
+  .btn-connect,
+  .btn-claim,
+  .nav-wallet,
+  .nav-balance {
+    width: 100%;
+    min-width: 0;
+    padding: 10px 8px;
+    text-align: center;
+    white-space: nowrap;
+    font-size: 0.78rem;
+  }
+
+  .hero {
+    min-height: auto;
+    padding: 34px 18px;
+    border-radius: 0;
+    margin-inline: -12px;
+  }
+
+  .hero-title {
+    font-size: clamp(2.2rem, 14vw, 3.45rem);
+    line-height: 1;
+  }
+
+  .hero-subtitle {
+    font-size: 0.98rem;
+    line-height: 1.55;
+  }
+
+  .hero-buttons,
+  .predict-btns,
+  .predict-teams,
+  .pool-bar {
+    flex-direction: column;
+  }
+
+  .hero-buttons .btn-primary,
+  .hero-buttons .btn-outline,
+  .predict-btns .pbtn {
+    width: 100%;
+  }
+
+  .features,
+  .matches-grid,
+  .stats,
+  .odds-row {
+    grid-template-columns: 1fr;
+  }
+
+  .feature,
+  .match-card,
+  .predict-teams,
+  .predict-contract,
+  .not-on-chain,
+  .empty-state {
+    padding: 18px;
+  }
+
+  .matches-header {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .matches-header h2 {
+    font-size: 1.75rem;
+  }
+
+  .btn-refresh {
+    width: 100%;
+  }
+
+  .card-teams {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    gap: 8px;
+  }
+
+  .card-logo {
+    width: 38px;
+    height: 38px;
+  }
+
+  .card-name,
+  .predict-team-name {
+    overflow-wrap: anywhere;
+  }
+
+  .predict-score {
+    padding: 16px 0;
+    font-size: 1.6rem;
+  }
+
+  .predict-logo {
+    width: 64px;
+    height: 64px;
+  }
+
+  .stake-input-row {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .stake-input {
+    width: 100%;
+  }
+
+  .pool-label,
+  .pool-amount {
+    width: 100%;
+    text-align: left;
+  }
+}
+
+@media (max-width: 380px) {
+  .nav-tab,
+  .btn-connect,
+  .btn-claim,
+  .nav-wallet,
+  .nav-balance {
+    font-size: 0.72rem;
+    padding-inline: 6px;
+  }
+
+  .hero-title {
+    font-size: 2rem;
+  }
+
+  .card-teams {
+    grid-template-columns: 1fr;
+  }
+
+  .card-vs {
+    order: -1;
+  }
+}
 </style>
