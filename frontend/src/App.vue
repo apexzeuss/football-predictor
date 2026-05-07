@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 
 const CONTRACT_ADDRESS = import.meta.env.VITE_CONTRACT_ADDRESS
 const API_KEY = import.meta.env.VITE_FOOTBALL_API_KEY
@@ -13,6 +13,30 @@ const staking = ref(false)
 const creating = ref(false)
 const message = ref('')
 const messageType = ref('info')
+const walletAddress = ref('')
+const balance = ref(0)
+const stakeAmount = ref(1000)
+const homeOdds = computed(() => contractMatch.value ? parseFloat(((contractMatch.value.draw_stakes + contractMatch.value.away_stakes + stakeAmount.value) / (contractMatch.value.home_stakes + stakeAmount.value || 1)).toFixed(2)) : 2.0)
+const drawOdds = computed(() => contractMatch.value ? parseFloat(((contractMatch.value.home_stakes + contractMatch.value.away_stakes + stakeAmount.value) / (contractMatch.value.draw_stakes + stakeAmount.value || 1)).toFixed(2)) : 3.0)
+const awayOdds = computed(() => contractMatch.value ? parseFloat(((contractMatch.value.home_stakes + contractMatch.value.draw_stakes + stakeAmount.value) / (contractMatch.value.away_stakes + stakeAmount.value || 1)).toFixed(2)) : 2.5)
+
+async function connectWallet() {
+  try {
+    const accounts = await (window as any).ethereum.request({ method: 'eth_requestAccounts' })
+    walletAddress.value = accounts[0]
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+const claimed = ref(false)
+function claimTokens() {
+  if (claimed.value) return
+  balance.value = 100000
+  claimed.value = true
+  message.value = '100,000 GENPRED claimed!'
+  messageType.value = 'success'
+}
 
 async function getClient() {
   const { createClient, createAccount } = await import('genlayer-js')
@@ -23,7 +47,9 @@ async function getClient() {
 async function fetchMatches() {
   loading.value = true
   try {
-    const today = new Date().toISOString().split('T')[0]
+    const d = new Date()
+d.setDate(d.getDate() + 1)
+const today = d.toISOString().split('T')[0]
     const res = await fetch(
       `https://v3.football.api-sports.io/fixtures?date=${today}&timezone=UTC`,
       { headers: { 'x-apisports-key': API_KEY } }
@@ -135,7 +161,12 @@ onMounted(fetchMatches)
         <button :class="['nav-tab', activeTab === 'matches' ? 'active' : '']" @click="activeTab = 'matches'; fetchMatches()">Matches</button>
         <button :class="['nav-tab', activeTab === 'predict' ? 'active' : '']" @click="activeTab = 'predict'">Predict</button>
       </div>
-      <div class="nav-wallet">0xBceFf...7b2</div>
+    <div class="nav-right">
+  <button v-if="!walletAddress" class="btn-connect" @click="connectWallet">Connect Wallet</button>
+  <div v-else class="nav-wallet">{{ walletAddress.slice(0,6) }}...{{ walletAddress.slice(-4) }}</div>
+  <button v-if="!claimed" class="btn-claim" @click="claimTokens">Claim 100K GENPRED</button>
+  <div v-else class="nav-balance">{{ balance.toLocaleString() }} GENPRED</div>
+</div>
     </nav>
 
     <!-- HOME TAB -->
@@ -296,7 +327,17 @@ onMounted(fetchMatches)
           </div>
 
           <div v-else class="predict-actions">
-            <div class="predict-hint">Place your prediction — 100 GENPRED per stake</div>
+            <div class="predict-hint">Your balance: {{ balance.toLocaleString() }} GENPRED</div>
+<div class="stake-input-row">
+  <label>Stake amount:</label>
+  <input type="number" v-model="stakeAmount" min="100" step="100" class="stake-input" />
+  <span class="stake-currency">GENPRED</span>
+</div>
+<div class="odds-row">
+  <div class="odd-box">Home Win odds: <strong>{{ homeOdds }}x</strong> — Win: <strong>{{ (stakeAmount * homeOdds).toLocaleString() }} GENPRED</strong></div>
+  <div class="odd-box">Draw odds: <strong>{{ drawOdds }}x</strong> — Win: <strong>{{ (stakeAmount * drawOdds).toLocaleString() }} GENPRED</strong></div>
+  <div class="odd-box">Away Win odds: <strong>{{ awayOdds }}x</strong> — Win: <strong>{{ (stakeAmount * awayOdds).toLocaleString() }} GENPRED</strong></div>
+</div>
             <div class="predict-btns">
               <button class="pbtn home" @click="stake('home')" :disabled="staking">
                 {{ staking ? 'Processing...' : selectedMatch.teams.home.name + ' Wins' }}
@@ -759,4 +800,14 @@ body {
 .msg.info { background: rgba(99,102,241,0.1); color: #818cf8; border: 1px solid rgba(99,102,241,0.2); }
 .msg.success { background: rgba(34,197,94,0.1); color: #22c55e; border: 1px solid rgba(34,197,94,0.2); }
 .msg.error { background: rgba(239,68,68,0.1); color: #ef4444; border: 1px solid rgba(239,68,68,0.2); }
+.nav-right { display: flex; align-items: center; gap: 12px; }
+.btn-connect { padding: 8px 20px; background: #4f46e5; color: #fff; border: none; border-radius: 20px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.nav-balance { background: #1a1a1a; border: 1px solid #222; color: #22c55e; padding: 6px 14px; border-radius: 20px; font-size: 12px; cursor: pointer; }
+.btn-claim { padding: 8px 20px; background: #22c55e; color: #000; border: none; border-radius: 20px; font-size: 13px; font-weight: 700; cursor: pointer; }
+.stake-input-row { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+.stake-input { background: #1a1a1a; border: 1px solid #333; color: #fff; padding: 10px; border-radius: 8px; font-size: 14px; width: 150px; }
+.stake-currency { color: #555; font-size: 13px; }
+.odds-row { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+.odd-box { background: #1a1a1a; border: 1px solid #222; padding: 10px 16px; border-radius: 8px; font-size: 13px; color: #888; }
+.odd-box strong { color: #22c55e; }
 </style>
