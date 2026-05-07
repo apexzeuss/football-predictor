@@ -16,6 +16,8 @@ const messageType = ref('info')
 const walletAddress = ref('')
 const balance = ref(0)
 const stakeAmount = ref(1000)
+const apiNotice = ref('')
+const feedMode = ref<'api' | 'demo'>('api')
 const normalizedStake = computed(() => Math.max(100, Number(stakeAmount.value) || 100))
 const homeStake = computed(() => Number(contractMatch.value?.home_stakes) || 0)
 const drawStake = computed(() => Number(contractMatch.value?.draw_stakes) || 0)
@@ -24,7 +26,7 @@ const totalPool = computed(() => homeStake.value + drawStake.value + awayStake.v
 const homeOdds = computed(() => contractMatch.value ? parseFloat(((drawStake.value + awayStake.value + normalizedStake.value) / Math.max(homeStake.value + normalizedStake.value, 1)).toFixed(2)) : 2.0)
 const drawOdds = computed(() => contractMatch.value ? parseFloat(((homeStake.value + awayStake.value + normalizedStake.value) / Math.max(drawStake.value + normalizedStake.value, 1)).toFixed(2)) : 3.0)
 const awayOdds = computed(() => contractMatch.value ? parseFloat(((homeStake.value + drawStake.value + normalizedStake.value) / Math.max(awayStake.value + normalizedStake.value, 1)).toFixed(2)) : 2.5)
-const finishedStatuses = new Set(['FT', 'AET', 'PEN'])
+const matchFeedTitle = computed(() => feedMode.value === 'demo' ? 'Demo Matches' : 'Upcoming Matches')
 const closedStatuses = new Set(['FT', 'AET', 'PEN', 'CANC', 'PST', 'ABD', 'AWD', 'WO'])
 const validTabs = new Set(['home', 'matches', 'predict'])
 
@@ -50,14 +52,76 @@ function syncTabFromHistory() {
   if (activeTab.value === 'matches') fetchMatches()
 }
 
-function getLocalMatchDate() {
+function formatLocalMatchDate(date: Date) {
   const formatter = new Intl.DateTimeFormat('en-CA', {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit'
   })
 
-  return formatter.format(new Date())
+  return formatter.format(date)
+}
+
+function getUpcomingDates(days = 7) {
+  return Array.from({ length: days }, (_, index) => {
+    const date = new Date()
+    date.setDate(date.getDate() + index)
+    return formatLocalMatchDate(date)
+  })
+}
+
+function hasApiErrors(errors: unknown) {
+  return !!errors && typeof errors === 'object' && Object.keys(errors).length > 0
+}
+
+function getApiErrorMessage(errors: any) {
+  if (!hasApiErrors(errors)) return ''
+  return Object.values(errors).join(' ')
+}
+
+function showDemoMatches() {
+  feedMode.value = 'demo'
+  apiNotice.value = 'Showing demo matches while live fixtures refresh.'
+  matches.value = createDemoMatches()
+}
+
+function createDemoMatches() {
+  const teams = [
+    ['Arsenal', 'Chelsea'],
+    ['Barcelona', 'Sevilla'],
+    ['Inter', 'Napoli'],
+    ['Borussia Dortmund', 'RB Leipzig'],
+    ['Paris Saint-Germain', 'Marseille'],
+    ['Ajax', 'PSV Eindhoven']
+  ]
+
+  return teams.map(([home, away], index) => {
+    const kickoff = new Date()
+    kickoff.setHours(kickoff.getHours() + 2 + index * 3, 0, 0, 0)
+
+    return {
+      fixture: {
+        id: `demo_${index + 1}`,
+        date: kickoff.toISOString(),
+        status: { short: 'NS', long: 'Not Started' }
+      },
+      league: {
+        name: 'Demo League',
+        country: 'GenPredict'
+      },
+      teams: {
+        home: {
+          name: home,
+          logo: `https://ui-avatars.com/api/?name=${encodeURIComponent(home)}&background=147d64&color=fff&bold=true`
+        },
+        away: {
+          name: away,
+          logo: `https://ui-avatars.com/api/?name=${encodeURIComponent(away)}&background=e1a72f&color=14211b&bold=true`
+        }
+      },
+      goals: { home: null, away: null }
+    }
+  })
 }
 
 async function connectWallet() {
@@ -93,24 +157,38 @@ async function getClient() {
 
 async function fetchMatches() {
   loading.value = true
+  apiNotice.value = ''
+  feedMode.value = 'api'
   try {
-    const today = getLocalMatchDate()
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
-    const res = await fetch(
-      `https://v3.football.api-sports.io/fixtures?date=${today}&timezone=${encodeURIComponent(timezone)}`,
-      { headers: { 'x-apisports-key': API_KEY } }
-    )
-    if (!res.ok) throw new Error(`Football API request failed with ${res.status}`)
-    const data = await res.json()
-    if (!Array.isArray(data.response)) throw new Error(data.message || 'Football API returned no matches')
-    matches.value = data.response
-      .filter((match: any) => !finishedStatuses.has(match.fixture.status.short))
+    const upcomingMatches = []
+
+    for (const date of getUpcomingDates(2)) {
+      const res = await fetch(
+        `https://v3.football.api-sports.io/fixtures?date=${date}&timezone=${encodeURIComponent(timezone)}`,
+        { headers: { 'x-apisports-key': API_KEY } }
+      )
+      if (!res.ok) throw new Error(`Football API request failed with ${res.status}`)
+      const data = await res.json()
+      if (hasApiErrors(data.errors)) throw new Error(getApiErrorMessage(data.errors))
+      if (!Array.isArray(data.response)) throw new Error(data.message || 'Football API returned no matches')
+
+      upcomingMatches.push(
+        ...data.response.filter((match: any) => !closedStatuses.has(match.fixture.status.short))
+      )
+      if (upcomingMatches.length >= 30) break
+    }
+
+    matches.value = upcomingMatches
+      .sort((a: any, b: any) => new Date(a.fixture.date).getTime() - new Date(b.fixture.date).getTime())
       .slice(0, 30)
+
+    if (!matches.value.length) {
+      showDemoMatches()
+    }
   } catch (e) {
     console.error(e)
-    matches.value = []
-    message.value = 'Could not load matches. Check your API key or try again later.'
-    messageType.value = 'error'
+    showDemoMatches()
   } finally {
     loading.value = false
   }
@@ -307,13 +385,27 @@ onUnmounted(() => {
     <!-- MATCHES TAB -->
     <div v-if="activeTab === 'matches'" class="tab-content">
       <div class="matches-header">
-        <h2>Today's Matches</h2>
+        <h2>{{ matchFeedTitle }}</h2>
         <button class="btn-refresh" @click="fetchMatches" :disabled="loading">
           {{ loading ? 'Loading...' : 'Refresh' }}
         </button>
       </div>
 
+      <div v-if="apiNotice" class="api-notice">
+        {{ apiNotice }}
+      </div>
+
+      <div class="feed-note">
+        Real fixtures appear automatically when available. Demo matches keep predictions testable while the feed refreshes.
+      </div>
+
       <div v-if="loading" class="loading">Loading matches...</div>
+
+      <div v-else-if="!matches.length" class="empty-state compact">
+        <div class="empty-title">No upcoming matches found</div>
+        <div class="empty-desc">Try refreshing in a bit. The football API may not have fixtures available for the next few days.</div>
+        <button class="btn-primary" @click="fetchMatches">Refresh matches</button>
+      </div>
 
       <div class="matches-grid">
         <div
@@ -342,7 +434,7 @@ onUnmounted(() => {
               <div class="card-name">{{ match.teams.away.name }}</div>
             </div>
           </div>
-          <div class="card-action">Click to predict</div>
+          <div class="card-action">{{ feedMode === 'demo' ? 'Demo prediction' : 'Click to predict' }}</div>
         </div>
       </div>
     </div>
@@ -844,6 +936,7 @@ body {
 .card-action { text-align: center; color: #333; font-size: 11px; }
 
 .empty-state { text-align: center; padding: 100px 20px; }
+.empty-state.compact { padding: 34px 20px; }
 .empty-title { font-size: 1.2rem; font-weight: 700; margin-bottom: 8px; }
 .empty-desc { color: #555; margin-bottom: 24px; }
 
@@ -1287,6 +1380,26 @@ h2 {
 
 .loading {
   color: var(--muted);
+}
+
+.api-notice {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  background: rgba(225, 167, 47, 0.16);
+  border: 1px solid rgba(225, 167, 47, 0.34);
+  border-radius: 8px;
+  color: #6f4e08;
+  font-size: 0.9rem;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.feed-note {
+  margin: -4px 0 16px;
+  color: var(--muted);
+  font-size: 0.86rem;
+  font-weight: 600;
+  line-height: 1.55;
 }
 
 .matches-grid {
