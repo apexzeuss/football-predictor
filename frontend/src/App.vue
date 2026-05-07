@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 
 const CONTRACT_ADDRESS = import.meta.env.VITE_CONTRACT_ADDRESS
 const API_KEY = import.meta.env.VITE_FOOTBALL_API_KEY
@@ -26,6 +26,29 @@ const drawOdds = computed(() => contractMatch.value ? parseFloat(((homeStake.val
 const awayOdds = computed(() => contractMatch.value ? parseFloat(((homeStake.value + drawStake.value + normalizedStake.value) / Math.max(awayStake.value + normalizedStake.value, 1)).toFixed(2)) : 2.5)
 const finishedStatuses = new Set(['FT', 'AET', 'PEN'])
 const closedStatuses = new Set(['FT', 'AET', 'PEN', 'CANC', 'PST', 'ABD', 'AWD', 'WO'])
+const validTabs = new Set(['home', 'matches', 'predict'])
+
+function getTabFromLocation() {
+  const tab = window.location.hash.replace('#', '')
+  return validTabs.has(tab) ? tab : 'home'
+}
+
+function navigate(tab: string, replace = false) {
+  activeTab.value = tab
+
+  if (tab === 'matches') fetchMatches()
+
+  const nextUrl = `${window.location.pathname}${window.location.search}#${tab}`
+  if (window.location.hash !== `#${tab}`) {
+    const method = replace ? 'replaceState' : 'pushState'
+    window.history[method]({ tab }, '', nextUrl)
+  }
+}
+
+function syncTabFromHistory() {
+  activeTab.value = getTabFromLocation()
+  if (activeTab.value === 'matches') fetchMatches()
+}
 
 function getLocalMatchDate() {
   const formatter = new Intl.DateTimeFormat('en-CA', {
@@ -93,10 +116,10 @@ async function fetchMatches() {
   }
 }
 
-async function selectMatch(match: any) {
+async function selectMatch(match: any, pushHistory = true) {
   selectedMatch.value = match
   contractMatch.value = null
-  activeTab.value = 'predict'
+  navigate('predict', !pushHistory)
   const matchId = `match_${match.fixture.id}`
   try {
     const client = await getClient()
@@ -153,7 +176,7 @@ async function createAndStake(match: any, prediction: string) {
     balance.value = Math.max(0, balance.value - normalizedStake.value)
     message.value = 'Stake placed successfully!'
     messageType.value = 'success'
-    await selectMatch(match)
+    await selectMatch(match, false)
   } catch (e) {
     console.error(e)
     message.value = 'Something went wrong. Try again.'
@@ -193,7 +216,7 @@ async function stake(prediction: string) {
     balance.value = Math.max(0, balance.value - normalizedStake.value)
     message.value = 'Stake placed successfully!'
     messageType.value = 'success'
-    await selectMatch(selectedMatch.value)
+    await selectMatch(selectedMatch.value, false)
   } catch (e) {
     console.error(e)
     message.value = 'Stake failed. Try again.'
@@ -202,7 +225,15 @@ async function stake(prediction: string) {
   staking.value = false
 }
 
-onMounted(fetchMatches)
+onMounted(() => {
+  syncTabFromHistory()
+  fetchMatches()
+  window.addEventListener('popstate', syncTabFromHistory)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('popstate', syncTabFromHistory)
+})
 </script>
 
 <template>
@@ -210,9 +241,9 @@ onMounted(fetchMatches)
     <nav class="navbar">
       <div class="nav-logo">GenPredict</div>
       <div class="nav-tabs">
-        <button :class="['nav-tab', activeTab === 'home' ? 'active' : '']" @click="activeTab = 'home'">Home</button>
-        <button :class="['nav-tab', activeTab === 'matches' ? 'active' : '']" @click="activeTab = 'matches'; fetchMatches()">Matches</button>
-        <button :class="['nav-tab', activeTab === 'predict' ? 'active' : '']" @click="activeTab = 'predict'">Predict</button>
+        <button :class="['nav-tab', activeTab === 'home' ? 'active' : '']" @click="navigate('home')">Home</button>
+        <button :class="['nav-tab', activeTab === 'matches' ? 'active' : '']" @click="navigate('matches')">Matches</button>
+        <button :class="['nav-tab', activeTab === 'predict' ? 'active' : '']" @click="navigate('predict')">Predict</button>
       </div>
     <div class="nav-right">
   <button v-if="!walletAddress" class="btn-connect" @click="connectWallet">Connect Wallet</button>
@@ -229,8 +260,8 @@ onMounted(fetchMatches)
         <h1 class="hero-title">Predict Football.<br>Earn on the Blockchain.</h1>
         <p class="hero-subtitle">GenPredict uses decentralized AI to automatically verify match results and pay out winners no middlemen, no manipulation.</p>
         <div class="hero-buttons">
-          <button class="btn-primary" @click="activeTab = 'matches'; fetchMatches()">Browse Matches</button>
-          <button class="btn-outline" @click="activeTab = 'predict'">My Predictions</button>
+          <button class="btn-primary" @click="navigate('matches')">Browse Matches</button>
+          <button class="btn-outline" @click="navigate('predict')">My Predictions</button>
         </div>
       </div>
 
@@ -321,10 +352,11 @@ onMounted(fetchMatches)
       <div v-if="!selectedMatch" class="empty-state">
         <div class="empty-title">No match selected</div>
         <div class="empty-desc">Go to Matches and click on a match to predict</div>
-        <button class="btn-primary" @click="activeTab = 'matches'; fetchMatches()">Browse Matches</button>
+        <button class="btn-primary" @click="navigate('matches')">Browse Matches</button>
       </div>
 
       <div v-else class="predict-detail">
+        <button class="back-link" @click="navigate('matches')">Back to matches</button>
         <div class="predict-league">{{ selectedMatch.league.name }} · {{ selectedMatch.fixture.date.split('T')[0] }}</div>
 
         <div class="predict-teams">
@@ -406,18 +438,28 @@ onMounted(fetchMatches)
         </div>
 
         <div v-else class="not-on-chain">
-          <p>This match is not on GenPredict yet. Be the first to add it!</p>
+          <p>No prediction pool exists for this match yet. Create the pool and place your first stake in one step.</p>
           <div class="first-predict">
-            <div class="first-hint">Choose your prediction to add this match:</div>
+            <div class="first-hint">Your balance: {{ balance.toLocaleString() }} GENPRED</div>
+            <div class="stake-input-row">
+              <label>Stake amount:</label>
+              <input type="number" v-model.number="stakeAmount" min="100" step="100" class="stake-input" />
+              <span class="stake-currency">GENPRED</span>
+            </div>
+            <div class="odds-row">
+              <div class="odd-box">Home estimate: <strong>{{ homeOdds }}x</strong> · Win: <strong>{{ (normalizedStake * homeOdds).toLocaleString() }} GENPRED</strong></div>
+              <div class="odd-box">Draw estimate: <strong>{{ drawOdds }}x</strong> · Win: <strong>{{ (normalizedStake * drawOdds).toLocaleString() }} GENPRED</strong></div>
+              <div class="odd-box">Away estimate: <strong>{{ awayOdds }}x</strong> · Win: <strong>{{ (normalizedStake * awayOdds).toLocaleString() }} GENPRED</strong></div>
+            </div>
             <div class="predict-btns">
               <button class="pbtn home" @click="createAndStake(selectedMatch, 'home')" :disabled="creating">
-                {{ creating ? 'Processing...' : selectedMatch.teams.home.name + ' Wins' }}
+                {{ creating ? 'Processing...' : 'Create pool · ' + selectedMatch.teams.home.name }}
               </button>
               <button class="pbtn draw" @click="createAndStake(selectedMatch, 'draw')" :disabled="creating">
-                {{ creating ? 'Processing...' : 'Draw' }}
+                {{ creating ? 'Processing...' : 'Create pool · Draw' }}
               </button>
               <button class="pbtn away" @click="createAndStake(selectedMatch, 'away')" :disabled="creating">
-                {{ creating ? 'Processing...' : selectedMatch.teams.away.name + ' Wins' }}
+                {{ creating ? 'Processing...' : 'Create pool · ' + selectedMatch.teams.away.name }}
               </button>
             </div>
           </div>
@@ -1047,6 +1089,24 @@ body {
   font-weight: 700;
 }
 
+.back-link {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--surface-strong);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.9rem;
+  font-weight: 800;
+}
+
+.back-link:hover {
+  background: #fff;
+  border-color: rgba(20, 125, 100, 0.35);
+}
+
 .tab-content {
   width: min(1160px, calc(100% - 32px));
   max-width: none;
@@ -1172,7 +1232,6 @@ h2 {
 
 .feature-desc,
 .stat-label,
-.hero-subtitle,
 .empty-desc,
 .predict-hint,
 .first-hint,
@@ -1186,6 +1245,10 @@ h2 {
 .pool-amount,
 .stake-currency {
   color: var(--muted);
+}
+
+.hero .hero-subtitle {
+  color: rgba(255, 255, 255, 0.9);
 }
 
 .stats {
