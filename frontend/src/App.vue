@@ -18,6 +18,19 @@ const balance = ref(0)
 const stakeAmount = ref(1000)
 const apiNotice = ref('')
 const feedMode = ref<'api' | 'demo'>('api')
+const showWalletPicker = ref(false)
+const availableWallets = ref<any[]>([])
+const predictions = ref<any[]>([])
+const pendingPrediction = ref<any>(null)
+const matchSearch = ref('')
+const sourceFilter = ref('all')
+const statusFilter = ref('all')
+const STORAGE_KEYS = {
+  wallet: 'genpredict.wallet',
+  balance: 'genpredict.balance',
+  claimed: 'genpredict.claimed',
+  predictions: 'genpredict.predictions'
+}
 const normalizedStake = computed(() => Math.max(100, Number(stakeAmount.value) || 100))
 const homeStake = computed(() => Number(contractMatch.value?.home_stakes) || 0)
 const drawStake = computed(() => Number(contractMatch.value?.draw_stakes) || 0)
@@ -27,8 +40,52 @@ const homeOdds = computed(() => contractMatch.value ? parseFloat(((drawStake.val
 const drawOdds = computed(() => contractMatch.value ? parseFloat(((homeStake.value + awayStake.value + normalizedStake.value) / Math.max(drawStake.value + normalizedStake.value, 1)).toFixed(2)) : 3.0)
 const awayOdds = computed(() => contractMatch.value ? parseFloat(((homeStake.value + drawStake.value + normalizedStake.value) / Math.max(awayStake.value + normalizedStake.value, 1)).toFixed(2)) : 2.5)
 const matchFeedTitle = computed(() => feedMode.value === 'demo' ? 'Demo Matches' : 'Upcoming Matches')
+const sortedPredictions = computed(() =>
+  [...predictions.value].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+)
+const filteredMatches = computed(() => {
+  const query = matchSearch.value.trim().toLowerCase()
+
+  return matches.value.filter((match: any) => {
+    const isDemo = String(match.fixture.id).startsWith('demo_')
+    const status = match.fixture.status.short
+    const text = `${match.teams.home.name} ${match.teams.away.name} ${match.league.name} ${match.league.country}`.toLowerCase()
+
+    if (sourceFilter.value === 'real' && isDemo) return false
+    if (sourceFilter.value === 'demo' && !isDemo) return false
+    if (statusFilter.value === 'live' && !['1H', 'HT', '2H', 'ET', 'BT', 'P', 'SUSP', 'INT', 'LIVE'].includes(status)) return false
+    if (statusFilter.value === 'upcoming' && status !== 'NS' && status !== 'TBD') return false
+
+    return !query || text.includes(query)
+  })
+})
+const leaderboard = computed(() => {
+  const table = new Map<string, any>()
+
+  for (const prediction of predictions.value) {
+    const key = walletAddress.value || 'Demo user'
+    const current = table.get(key) || {
+      wallet: key,
+      predictions: 0,
+      totalStaked: 0,
+      potentialPayout: 0
+    }
+
+    current.predictions += 1
+    current.totalStaked += Number(prediction.amount) || 0
+    current.potentialPayout += Number(prediction.potentialPayout) || 0
+    table.set(key, current)
+  }
+
+  return [...table.values()].sort((a, b) => b.potentialPayout - a.potentialPayout)
+})
+const verificationItems = computed(() => [
+  { label: 'Result oracle', value: 'AI validation pending' },
+  { label: 'Payout state', value: sortedPredictions.value.length ? 'Awaiting final scores' : 'No active predictions' },
+  { label: 'Source check', value: feedMode.value === 'demo' ? 'Demo feed' : 'Football API feed' }
+])
 const closedStatuses = new Set(['FT', 'AET', 'PEN', 'CANC', 'PST', 'ABD', 'AWD', 'WO'])
-const validTabs = new Set(['home', 'matches', 'predict'])
+const validTabs = new Set(['home', 'matches', 'predict', 'predictions'])
 
 function getTabFromLocation() {
   const tab = window.location.hash.replace('#', '')
@@ -45,6 +102,18 @@ function navigate(tab: string, replace = false) {
     const method = replace ? 'replaceState' : 'pushState'
     window.history[method]({ tab }, '', nextUrl)
   }
+}
+
+function getPredictionLabel(match: any, prediction: string) {
+  if (prediction === 'home') return `${match.teams.home.name} win`
+  if (prediction === 'away') return `${match.teams.away.name} win`
+  return 'Draw'
+}
+
+function getPredictionOdds(prediction: string) {
+  if (prediction === 'home') return homeOdds.value
+  if (prediction === 'away') return awayOdds.value
+  return drawOdds.value
 }
 
 function syncTabFromHistory() {
@@ -79,10 +148,56 @@ function getApiErrorMessage(errors: any) {
   return Object.values(errors).join(' ')
 }
 
+function getInjectedWallets() {
+  const ethereum = (window as any).ethereum
+  if (!ethereum) return []
+
+  const providers = Array.isArray(ethereum.providers) ? ethereum.providers : [ethereum]
+  const named = providers.map((provider: any) => {
+    const name =
+      provider.isMetaMask ? 'MetaMask' :
+      provider.isCoinbaseWallet ? 'Coinbase Wallet' :
+      provider.isRabby ? 'Rabby' :
+      provider.isTrust ? 'Trust Wallet' :
+      provider.isBraveWallet ? 'Brave Wallet' :
+      'Browser Wallet'
+
+    return { name, provider }
+  })
+
+  return named.filter((wallet: any, index: number, list: any[]) =>
+    list.findIndex((item: any) => item.name === wallet.name) === index
+  )
+}
+
 function showDemoMatches() {
   feedMode.value = 'demo'
   apiNotice.value = 'Showing demo matches while live fixtures refresh.'
   matches.value = createDemoMatches()
+}
+
+function showRealMatches() {
+  feedMode.value = 'api'
+  fetchMatches()
+}
+
+function isDemoMatch(match: any) {
+  return String(match.fixture.id).startsWith('demo_')
+}
+
+async function fetchFixturesByDate(date: string, timezone: string) {
+  const params = new URLSearchParams({ date, timezone })
+  const proxyRes = await fetch(`/api/fixtures?${params.toString()}`)
+
+  if (proxyRes.ok) return proxyRes.json()
+
+  const directRes = await fetch(
+    `https://v3.football.api-sports.io/fixtures?date=${date}&timezone=${encodeURIComponent(timezone)}`,
+    { headers: { 'x-apisports-key': API_KEY } }
+  )
+
+  if (!directRes.ok) throw new Error(`Football API request failed with ${directRes.status}`)
+  return directRes.json()
 }
 
 function createDemoMatches() {
@@ -125,14 +240,28 @@ function createDemoMatches() {
 }
 
 async function connectWallet() {
+  availableWallets.value = getInjectedWallets()
+
+  if (!availableWallets.value.length) {
+    message.value = 'No browser wallet found. Install MetaMask, Coinbase Wallet, Rabby, or another EVM wallet.'
+    messageType.value = 'error'
+    return
+  }
+
+  if (availableWallets.value.length > 1) {
+    showWalletPicker.value = true
+    return
+  }
+
+  await connectWalletProvider(availableWallets.value[0].provider)
+}
+
+async function connectWalletProvider(provider: any) {
   try {
-    if (!(window as any).ethereum) {
-      message.value = 'No browser wallet found.'
-      messageType.value = 'error'
-      return
-    }
-    const accounts = await (window as any).ethereum.request({ method: 'eth_requestAccounts' })
+    const accounts = await provider.request({ method: 'eth_requestAccounts' })
     walletAddress.value = accounts[0]
+    localStorage.setItem(STORAGE_KEYS.wallet, accounts[0])
+    showWalletPicker.value = false
   } catch (e) {
     console.error(e)
     message.value = 'Wallet connection failed.'
@@ -145,8 +274,46 @@ function claimTokens() {
   if (claimed.value) return
   balance.value = 100000
   claimed.value = true
+  localStorage.setItem(STORAGE_KEYS.balance, String(balance.value))
+  localStorage.setItem(STORAGE_KEYS.claimed, 'true')
   message.value = '100,000 GENPRED claimed!'
   messageType.value = 'success'
+}
+
+function disconnectWallet() {
+  walletAddress.value = ''
+  localStorage.removeItem(STORAGE_KEYS.wallet)
+  message.value = 'Wallet disconnected.'
+  messageType.value = 'info'
+}
+
+function persistBalance() {
+  localStorage.setItem(STORAGE_KEYS.balance, String(balance.value))
+}
+
+function persistPredictions() {
+  localStorage.setItem(STORAGE_KEYS.predictions, JSON.stringify(predictions.value))
+}
+
+function restoreSession() {
+  walletAddress.value = localStorage.getItem(STORAGE_KEYS.wallet) || ''
+  balance.value = Number(localStorage.getItem(STORAGE_KEYS.balance)) || 0
+  claimed.value = localStorage.getItem(STORAGE_KEYS.claimed) === 'true'
+  try {
+    predictions.value = JSON.parse(localStorage.getItem(STORAGE_KEYS.predictions) || '[]')
+  } catch {
+    predictions.value = []
+  }
+}
+
+function handleAccountsChanged(accounts: string[]) {
+  if (!accounts.length) {
+    disconnectWallet()
+    return
+  }
+
+  walletAddress.value = accounts[0]
+  localStorage.setItem(STORAGE_KEYS.wallet, accounts[0])
 }
 
 async function getClient() {
@@ -164,12 +331,7 @@ async function fetchMatches() {
     const upcomingMatches = []
 
     for (const date of getUpcomingDates(2)) {
-      const res = await fetch(
-        `https://v3.football.api-sports.io/fixtures?date=${date}&timezone=${encodeURIComponent(timezone)}`,
-        { headers: { 'x-apisports-key': API_KEY } }
-      )
-      if (!res.ok) throw new Error(`Football API request failed with ${res.status}`)
-      const data = await res.json()
+      const data = await fetchFixturesByDate(date, timezone)
       if (hasApiErrors(data.errors)) throw new Error(getApiErrorMessage(data.errors))
       if (!Array.isArray(data.response)) throw new Error(data.message || 'Football API returned no matches')
 
@@ -213,9 +375,14 @@ async function selectMatch(match: any, pushHistory = true) {
   }
 }
 
-async function createAndStake(match: any, prediction: string) {
+function openPredictionConfirm(mode: 'create' | 'stake', match: any, prediction: string) {
   if (closedStatuses.has(match.fixture.status.short)) {
     message.value = 'This match is already closed for predictions.'
+    messageType.value = 'error'
+    return
+  }
+  if (!walletAddress.value) {
+    message.value = 'Connect a wallet before placing a prediction.'
     messageType.value = 'error'
     return
   }
@@ -224,6 +391,55 @@ async function createAndStake(match: any, prediction: string) {
     messageType.value = 'error'
     return
   }
+
+  pendingPrediction.value = {
+    mode,
+    match,
+    prediction,
+    label: getPredictionLabel(match, prediction),
+    amount: normalizedStake.value,
+    odds: getPredictionOdds(prediction)
+  }
+}
+
+function cancelPredictionConfirm() {
+  pendingPrediction.value = null
+}
+
+async function confirmPrediction() {
+  if (!pendingPrediction.value) return
+  const pending = pendingPrediction.value
+  pendingPrediction.value = null
+
+  if (pending.mode === 'create') {
+    await createAndStake(pending.match, pending.prediction, pending)
+    return
+  }
+
+  await stake(pending.prediction, pending)
+}
+
+function recordPrediction(match: any, prediction: string, amount: number, odds: number, createdPool: boolean) {
+  predictions.value.unshift({
+    id: `${match.fixture.id}_${Date.now()}`,
+    matchId: `match_${match.fixture.id}`,
+    homeTeam: match.teams.home.name,
+    awayTeam: match.teams.away.name,
+    league: match.league.name,
+    date: match.fixture.date,
+    prediction,
+    predictionLabel: getPredictionLabel(match, prediction),
+    amount,
+    odds,
+    potentialPayout: Math.round(amount * odds),
+    status: 'Pending',
+    createdPool,
+    createdAt: new Date().toISOString()
+  })
+  persistPredictions()
+}
+
+async function createAndStake(match: any, prediction: string, pending = { amount: normalizedStake.value, odds: getPredictionOdds(prediction) }) {
   creating.value = true
   staking.value = true
   message.value = 'Adding match to blockchain...'
@@ -246,12 +462,14 @@ async function createAndStake(match: any, prediction: string) {
     await client.writeContract({
       address: CONTRACT_ADDRESS,
       functionName: 'stake',
-      args: [matchId, prediction, normalizedStake.value, walletAddress.value || '0xBceFf82Fa1473e28bB00E1A20CCD61ABce0477b2'],
+      args: [matchId, prediction, pending.amount, walletAddress.value],
       value: 0n,
       leaderOnly: true
     } as any)
 
-    balance.value = Math.max(0, balance.value - normalizedStake.value)
+    balance.value = Math.max(0, balance.value - pending.amount)
+    persistBalance()
+    recordPrediction(match, prediction, pending.amount, pending.odds, true)
     message.value = 'Stake placed successfully!'
     messageType.value = 'success'
     await selectMatch(match, false)
@@ -264,18 +482,8 @@ async function createAndStake(match: any, prediction: string) {
   staking.value = false
 }
 
-async function stake(prediction: string) {
+async function stake(prediction: string, pending = { amount: normalizedStake.value, odds: getPredictionOdds(prediction) }) {
   if (!selectedMatch.value) return
-  if (closedStatuses.has(selectedMatch.value.fixture.status.short)) {
-    message.value = 'This match is already closed for predictions.'
-    messageType.value = 'error'
-    return
-  }
-  if (balance.value < normalizedStake.value) {
-    message.value = 'Claim tokens or lower your stake amount first.'
-    messageType.value = 'error'
-    return
-  }
   staking.value = true
   message.value = 'Placing stake...'
   messageType.value = 'info'
@@ -286,12 +494,14 @@ async function stake(prediction: string) {
     await client.writeContract({
       address: CONTRACT_ADDRESS,
       functionName: 'stake',
-      args: [matchId, prediction, normalizedStake.value, walletAddress.value || '0xBceFf82Fa1473e28bB00E1A20CCD61ABce0477b2'],
+      args: [matchId, prediction, pending.amount, walletAddress.value],
       value: 0n,
       leaderOnly: true
     } as any)
 
-    balance.value = Math.max(0, balance.value - normalizedStake.value)
+    balance.value = Math.max(0, balance.value - pending.amount)
+    persistBalance()
+    recordPrediction(selectedMatch.value, prediction, pending.amount, pending.odds, false)
     message.value = 'Stake placed successfully!'
     messageType.value = 'success'
     await selectMatch(selectedMatch.value, false)
@@ -304,13 +514,16 @@ async function stake(prediction: string) {
 }
 
 onMounted(() => {
+  restoreSession()
   syncTabFromHistory()
   fetchMatches()
   window.addEventListener('popstate', syncTabFromHistory)
+  ;(window as any).ethereum?.on?.('accountsChanged', handleAccountsChanged)
 })
 
 onUnmounted(() => {
   window.removeEventListener('popstate', syncTabFromHistory)
+  ;(window as any).ethereum?.removeListener?.('accountsChanged', handleAccountsChanged)
 })
 </script>
 
@@ -321,14 +534,28 @@ onUnmounted(() => {
       <div class="nav-tabs">
         <button :class="['nav-tab', activeTab === 'home' ? 'active' : '']" @click="navigate('home')">Home</button>
         <button :class="['nav-tab', activeTab === 'matches' ? 'active' : '']" @click="navigate('matches')">Matches</button>
-        <button :class="['nav-tab', activeTab === 'predict' ? 'active' : '']" @click="navigate('predict')">Predict</button>
+        <button :class="['nav-tab', activeTab === 'predictions' ? 'active' : '']" @click="navigate('predictions')">My Predictions</button>
       </div>
-    <div class="nav-right">
-  <button v-if="!walletAddress" class="btn-connect" @click="connectWallet">Connect Wallet</button>
-  <div v-else class="nav-wallet">{{ walletAddress.slice(0,6) }}...{{ walletAddress.slice(-4) }}</div>
-  <button v-if="!claimed" class="btn-claim" @click="claimTokens">Claim 100K GENPRED</button>
-  <div v-else class="nav-balance">{{ balance.toLocaleString() }} GENPRED</div>
-</div>
+      <div class="nav-right">
+        <button v-if="!walletAddress && !showWalletPicker" class="btn-connect" @click="connectWallet">Connect Wallet</button>
+        <div v-else-if="showWalletPicker" class="wallet-picker">
+          <button
+            v-for="wallet in availableWallets"
+            :key="wallet.name"
+            class="wallet-option"
+            @click="connectWalletProvider(wallet.provider)"
+          >
+            {{ wallet.name }}
+          </button>
+          <button class="wallet-option muted" @click="showWalletPicker = false">Cancel</button>
+        </div>
+        <div v-else class="wallet-group">
+          <div class="nav-wallet">{{ walletAddress.slice(0,6) }}...{{ walletAddress.slice(-4) }}</div>
+          <button class="btn-disconnect" @click="disconnectWallet">Disconnect</button>
+        </div>
+        <button v-if="!claimed" class="btn-claim" @click="claimTokens">Claim Demo GENPRED</button>
+        <div v-else class="nav-balance">Demo: {{ balance.toLocaleString() }} GENPRED</div>
+      </div>
     </nav>
 
     <!-- HOME TAB -->
@@ -339,7 +566,7 @@ onUnmounted(() => {
         <p class="hero-subtitle">GenPredict uses decentralized AI to automatically verify match results and pay out winners no middlemen, no manipulation.</p>
         <div class="hero-buttons">
           <button class="btn-primary" @click="navigate('matches')">Browse Matches</button>
-          <button class="btn-outline" @click="navigate('predict')">My Predictions</button>
+          <button class="btn-outline" @click="navigate('predictions')">My Predictions</button>
         </div>
       </div>
 
@@ -399,22 +626,48 @@ onUnmounted(() => {
         Real fixtures appear automatically when available. Demo matches keep predictions testable while the feed refreshes.
       </div>
 
+      <div class="feed-legend">
+        <span><strong>Real</strong> live fixture data from the football feed</span>
+        <span><strong>Demo</strong> sample matches for testing predictions</span>
+      </div>
+
+      <div class="match-tools">
+        <input v-model="matchSearch" class="match-search" placeholder="Search team or league" />
+        <select v-model="sourceFilter" class="match-select">
+          <option value="all">All sources</option>
+          <option value="real">Real only</option>
+          <option value="demo">Demo only</option>
+        </select>
+        <select v-model="statusFilter" class="match-select">
+          <option value="all">All statuses</option>
+          <option value="upcoming">Upcoming</option>
+          <option value="live">Live</option>
+        </select>
+        <button class="btn-refresh" @click="showDemoMatches">Demo mode</button>
+        <button class="btn-refresh" @click="showRealMatches">Real feed</button>
+      </div>
+
       <div v-if="loading" class="loading">Loading matches...</div>
 
-      <div v-else-if="!matches.length" class="empty-state compact">
+      <div v-else-if="!filteredMatches.length" class="empty-state compact">
         <div class="empty-title">No upcoming matches found</div>
-        <div class="empty-desc">Try refreshing in a bit. The football API may not have fixtures available for the next few days.</div>
+        <div class="empty-desc">Try changing filters, switching to demo mode, or refreshing the live feed.</div>
         <button class="btn-primary" @click="fetchMatches">Refresh matches</button>
       </div>
 
       <div class="matches-grid">
         <div
-          v-for="match in matches"
+          v-for="match in filteredMatches"
           :key="match.fixture.id"
           class="match-card"
           @click="selectMatch(match)"
         >
-          <div class="card-league">{{ match.league.name }} · {{ match.league.country }}</div>
+          <div class="card-topline">
+            <div class="card-league">{{ match.league.name }} · {{ match.league.country }}</div>
+            <div :class="['feed-badge', isDemoMatch(match) ? 'demo' : 'real']">
+              {{ isDemoMatch(match) ? 'Demo' : 'Real' }}
+            </div>
+          </div>
           <div class="card-teams">
             <div class="card-team">
               <img :src="match.teams.home.logo" class="card-logo" />
@@ -504,7 +757,7 @@ onUnmounted(() => {
           </div>
 
           <div v-else class="predict-actions">
-            <div class="predict-hint">Your balance: {{ balance.toLocaleString() }} GENPRED</div>
+            <div class="predict-hint">Demo balance: {{ balance.toLocaleString() }} GENPRED</div>
 <div class="stake-input-row">
   <label>Stake amount:</label>
   <input type="number" v-model.number="stakeAmount" min="100" step="100" class="stake-input" />
@@ -516,13 +769,13 @@ onUnmounted(() => {
   <div class="odd-box">Away Win odds: <strong>{{ awayOdds }}x</strong> · Win: <strong>{{ (normalizedStake * awayOdds).toLocaleString() }} GENPRED</strong></div>
 </div>
             <div class="predict-btns">
-              <button class="pbtn home" @click="stake('home')" :disabled="staking">
+              <button class="pbtn home" @click="openPredictionConfirm('stake', selectedMatch, 'home')" :disabled="staking">
                 {{ staking ? 'Processing...' : selectedMatch.teams.home.name + ' Wins' }}
               </button>
-              <button class="pbtn draw" @click="stake('draw')" :disabled="staking">
+              <button class="pbtn draw" @click="openPredictionConfirm('stake', selectedMatch, 'draw')" :disabled="staking">
                 {{ staking ? 'Processing...' : 'Draw' }}
               </button>
-              <button class="pbtn away" @click="stake('away')" :disabled="staking">
+              <button class="pbtn away" @click="openPredictionConfirm('stake', selectedMatch, 'away')" :disabled="staking">
                 {{ staking ? 'Processing...' : selectedMatch.teams.away.name + ' Wins' }}
               </button>
             </div>
@@ -532,7 +785,7 @@ onUnmounted(() => {
         <div v-else class="not-on-chain">
           <p>No prediction pool exists for this match yet. Create the pool and place your first stake in one step.</p>
           <div class="first-predict">
-            <div class="first-hint">Your balance: {{ balance.toLocaleString() }} GENPRED</div>
+            <div class="first-hint">Demo balance: {{ balance.toLocaleString() }} GENPRED</div>
             <div class="stake-input-row">
               <label>Stake amount:</label>
               <input type="number" v-model.number="stakeAmount" min="100" step="100" class="stake-input" />
@@ -544,13 +797,13 @@ onUnmounted(() => {
               <div class="odd-box">Away estimate: <strong>{{ awayOdds }}x</strong> · Win: <strong>{{ (normalizedStake * awayOdds).toLocaleString() }} GENPRED</strong></div>
             </div>
             <div class="predict-btns">
-              <button class="pbtn home" @click="createAndStake(selectedMatch, 'home')" :disabled="creating">
+              <button class="pbtn home" @click="openPredictionConfirm('create', selectedMatch, 'home')" :disabled="creating">
                 {{ creating ? 'Processing...' : 'Create pool · ' + selectedMatch.teams.home.name }}
               </button>
-              <button class="pbtn draw" @click="createAndStake(selectedMatch, 'draw')" :disabled="creating">
+              <button class="pbtn draw" @click="openPredictionConfirm('create', selectedMatch, 'draw')" :disabled="creating">
                 {{ creating ? 'Processing...' : 'Create pool · Draw' }}
               </button>
-              <button class="pbtn away" @click="createAndStake(selectedMatch, 'away')" :disabled="creating">
+              <button class="pbtn away" @click="openPredictionConfirm('create', selectedMatch, 'away')" :disabled="creating">
                 {{ creating ? 'Processing...' : 'Create pool · ' + selectedMatch.teams.away.name }}
               </button>
             </div>
@@ -558,6 +811,93 @@ onUnmounted(() => {
         </div>
 
         <div v-if="message" class="msg" :class="messageType">{{ message }}</div>
+      </div>
+    </div>
+
+    <!-- MY PREDICTIONS TAB -->
+    <div v-if="activeTab === 'predictions'" class="tab-content">
+      <div class="matches-header">
+        <h2>My Predictions</h2>
+        <button class="btn-refresh" @click="navigate('matches')">Find matches</button>
+      </div>
+
+      <div v-if="!sortedPredictions.length" class="empty-state compact">
+        <div class="empty-title">No predictions yet</div>
+        <div class="empty-desc">Choose a match, confirm your stake, and your predictions will appear here.</div>
+        <button class="btn-primary" @click="navigate('matches')">Browse matches</button>
+      </div>
+
+      <div v-else class="prediction-list">
+        <div v-for="prediction in sortedPredictions" :key="prediction.id" class="prediction-card">
+          <div>
+            <div class="prediction-league">{{ prediction.league }} · {{ prediction.status }}</div>
+            <div class="prediction-title">{{ prediction.homeTeam }} vs {{ prediction.awayTeam }}</div>
+            <div class="prediction-choice">{{ prediction.predictionLabel }}</div>
+          </div>
+          <div class="prediction-metrics">
+            <div>
+              <span>Stake</span>
+              <strong>{{ prediction.amount.toLocaleString() }} GENPRED</strong>
+            </div>
+            <div>
+              <span>Odds</span>
+              <strong>{{ prediction.odds }}x</strong>
+            </div>
+            <div>
+              <span>Potential</span>
+              <strong>{{ prediction.potentialPayout.toLocaleString() }} GENPRED</strong>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="insight-grid">
+        <section class="insight-panel">
+          <div class="panel-title">Leaderboard</div>
+          <div v-if="!leaderboard.length" class="panel-empty">Place a prediction to enter the table.</div>
+          <div v-for="entry in leaderboard" :key="entry.wallet" class="leader-row">
+            <div>
+              <strong>{{ entry.wallet.slice(0, 6) }}{{ entry.wallet.length > 10 ? '...' + entry.wallet.slice(-4) : '' }}</strong>
+              <span>{{ entry.predictions }} predictions</span>
+            </div>
+            <div>{{ entry.potentialPayout.toLocaleString() }} GENPRED</div>
+          </div>
+        </section>
+
+        <section class="insight-panel">
+          <div class="panel-title">Result Verification</div>
+          <div v-for="item in verificationItems" :key="item.label" class="verify-row">
+            <span>{{ item.label }}</span>
+            <strong>{{ item.value }}</strong>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div v-if="pendingPrediction" class="modal-backdrop">
+      <div class="confirm-modal">
+        <div class="modal-kicker">Confirm prediction</div>
+        <h2>{{ pendingPrediction.label }}</h2>
+        <p>
+          You are staking <strong>{{ pendingPrediction.amount.toLocaleString() }} GENPRED</strong>
+          on {{ pendingPrediction.match.teams.home.name }} vs {{ pendingPrediction.match.teams.away.name }}.
+        </p>
+        <div class="confirm-grid">
+          <div>
+            <span>Odds</span>
+            <strong>{{ pendingPrediction.odds }}x</strong>
+          </div>
+          <div>
+            <span>Potential return</span>
+            <strong>{{ (pendingPrediction.amount * pendingPrediction.odds).toLocaleString() }} GENPRED</strong>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn-outline" @click="cancelPredictionConfirm">Cancel</button>
+          <button class="btn-primary" @click="confirmPrediction" :disabled="staking || creating">
+            {{ staking || creating ? 'Processing...' : 'Confirm stake' }}
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -1083,9 +1423,44 @@ body {
   flex-wrap: wrap;
 }
 
+.wallet-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.wallet-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.wallet-option {
+  padding: 10px 14px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--surface-strong);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.86rem;
+  font-weight: 800;
+}
+
+.wallet-option:hover {
+  border-color: rgba(20, 125, 100, 0.35);
+  color: var(--primary-dark);
+}
+
+.wallet-option.muted {
+  color: var(--muted);
+}
+
 .nav-tab,
 .btn-connect,
 .btn-claim,
+.btn-disconnect,
 .btn-refresh,
 .btn-primary,
 .btn-outline,
@@ -1122,9 +1497,23 @@ body {
 }
 
 .btn-connect,
-.btn-claim {
+.btn-claim,
+.btn-disconnect {
   padding: 10px 14px;
   font-size: 0.86rem;
+}
+
+.btn-disconnect {
+  background: #fff;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.btn-disconnect:hover {
+  color: var(--danger);
+  border-color: rgba(194, 65, 56, 0.28);
 }
 
 .btn-claim {
@@ -1402,6 +1791,45 @@ h2 {
   line-height: 1.55;
 }
 
+.feed-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.feed-legend span {
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.74);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.feed-legend strong {
+  color: var(--surface-strong);
+}
+
+.match-tools {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) repeat(4, auto);
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.match-search,
+.match-select {
+  min-height: 42px;
+  padding: 10px 12px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink);
+}
+
 .matches-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
@@ -1421,6 +1849,37 @@ h2 {
 .card-league {
   margin-bottom: 18px;
   font-size: 0.74rem;
+}
+
+.card-topline {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.card-topline .card-league {
+  margin-bottom: 0;
+}
+
+.feed-badge {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.feed-badge.real {
+  background: rgba(36, 138, 77, 0.1);
+  color: var(--success);
+}
+
+.feed-badge.demo {
+  background: rgba(225, 167, 47, 0.16);
+  color: #8a620e;
 }
 
 .card-teams {
@@ -1564,6 +2023,177 @@ h2 {
   color: var(--success);
 }
 
+.prediction-list {
+  display: grid;
+  gap: 12px;
+}
+
+.insight-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 18px;
+}
+
+.insight-panel {
+  padding: 20px;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(34, 55, 43, 0.07);
+}
+
+.panel-title {
+  margin-bottom: 14px;
+  color: var(--ink);
+  font-size: 1rem;
+  font-weight: 900;
+}
+
+.panel-empty {
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.leader-row,
+.verify-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+
+.leader-row:first-of-type,
+.verify-row:first-of-type {
+  border-top: 0;
+}
+
+.leader-row strong,
+.verify-row strong {
+  color: var(--surface-strong);
+}
+
+.leader-row span,
+.verify-row span {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.prediction-card {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 20px;
+  align-items: center;
+  padding: 20px;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(34, 55, 43, 0.07);
+}
+
+.prediction-league {
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.prediction-title {
+  color: var(--ink);
+  font-size: 1.1rem;
+  font-weight: 800;
+}
+
+.prediction-choice {
+  margin-top: 6px;
+  color: var(--primary-dark);
+  font-weight: 800;
+}
+
+.prediction-metrics,
+.confirm-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.prediction-metrics div,
+.confirm-grid div {
+  min-width: 120px;
+  padding: 12px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.prediction-metrics span,
+.confirm-grid span {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-weight: 800;
+}
+
+.prediction-metrics strong,
+.confirm-grid strong {
+  color: var(--surface-strong);
+  font-size: 0.92rem;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(10, 20, 16, 0.56);
+  backdrop-filter: blur(6px);
+}
+
+.confirm-modal {
+  width: min(520px, 100%);
+  padding: 24px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 24px 70px rgba(10, 20, 16, 0.25);
+}
+
+.modal-kicker {
+  margin-bottom: 8px;
+  color: var(--primary-dark);
+  font-size: 0.78rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.confirm-modal h2 {
+  margin-bottom: 12px;
+  color: var(--ink);
+  font-size: 1.8rem;
+  font-weight: 800;
+}
+
+.confirm-modal p {
+  margin-bottom: 16px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
+}
+
 .msg {
   border-radius: 8px;
   font-weight: 700;
@@ -1636,9 +2266,25 @@ h2 {
     grid-template-columns: 1fr;
   }
 
+  .wallet-group {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 6px;
+    width: 100%;
+  }
+
+  .wallet-picker {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 6px;
+    width: 100%;
+  }
+
   .nav-tab,
   .btn-connect,
   .btn-claim,
+  .btn-disconnect,
+  .wallet-option,
   .nav-wallet,
   .nav-balance {
     width: 100%;
@@ -1682,7 +2328,12 @@ h2 {
   .features,
   .matches-grid,
   .stats,
-  .odds-row {
+  .odds-row,
+  .prediction-card,
+  .prediction-metrics,
+  .confirm-grid,
+  .match-tools,
+  .insight-grid {
     grid-template-columns: 1fr;
   }
 
@@ -1703,6 +2354,11 @@ h2 {
 
   .matches-header h2 {
     font-size: 1.75rem;
+  }
+
+  .feed-legend {
+    display: grid;
+    grid-template-columns: 1fr;
   }
 
   .btn-refresh {
@@ -1745,6 +2401,14 @@ h2 {
     width: 100%;
   }
 
+  .modal-actions {
+    flex-direction: column-reverse;
+  }
+
+  .modal-actions button {
+    width: 100%;
+  }
+
   .pool-label,
   .pool-amount {
     width: 100%;
@@ -1756,6 +2420,8 @@ h2 {
   .nav-tab,
   .btn-connect,
   .btn-claim,
+  .btn-disconnect,
+  .wallet-option,
   .nav-wallet,
   .nav-balance {
     font-size: 0.72rem;
